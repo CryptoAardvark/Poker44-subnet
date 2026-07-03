@@ -3,7 +3,13 @@
 **Scope:** Emission/payout correctness in the validator reward pipeline.
 **Files:** `poker44/validator/forward.py`, `poker44/score/scoring.py`, `poker44/base/validator.py`
 **Audience:** Engineering manager / subnet owner
-**Severity of both issues:** High — each one can send 100% of a validator's miner emissions to the wrong UID.
+**Severity:** High — Bug #1 sends 100% of a validator's miner emissions to the wrong UID; Bug #3 crashes the validator's reward computation (denial-of-service), and chained with Bug #1's never-cleared buffer becomes a persistent stall of all scoring/payouts.
+
+> **Correction note (post-verification):** An earlier draft described Bug #3 as a miner
+> "capturing 100% of emissions" with NaN scores. On execution that is **not** what happens —
+> sklearn rejects NaN/Inf and raises `ValueError` *before* any reward is produced, so the real
+> effect is a crash/denial-of-service, not a payout capture. Section 2 has been corrected. The
+> recommended fixes are unchanged.
 
 ---
 
@@ -149,15 +155,16 @@ Either fix ensures emissions only flow to miners that are actually producing res
 
 ---
 
-## 2. BUG #3 — A miner can seize 100% of emissions by returning NaN / Infinity scores
+## 2. BUG #3 — Malformed (NaN/Inf) miner scores crash the reward cycle, and chained with Bug #1 cause a persistent scoring stall
 
 ### One-sentence summary
-Miner-supplied scores are converted with `float()` but never checked for being finite or
-in-range, so a malicious miner can return `NaN` (or `Infinity`), which slips past the
-"positive reward" guard and can win winner-take-all — letting a miner **pay itself** with
-garbage output instead of real detection work.
+Miner-supplied scores are converted with `float()` but never checked for being finite, so a
+malicious miner can return `NaN` (or `Infinity`); those values reach `sklearn`, which raises a
+`ValueError`, **crashing the entire reward cycle so no miner is scored or paid** — and because
+Bug #1 never clears the buffer, one such submission keeps re-crashing the validator on every
+future cycle that UID is evaluated, even after the attacker goes offline.
 
-### The mechanism, step by step
+### What actually happens (verified by running the code)
 
 **Step 1 — Scores are accepted without a finiteness/range check.**
 In `_run_forward_cycle` (`forward.py`):
@@ -169,71 +176,98 @@ if len(scores_f) != len(chunks):
 ```
 
 The **only** validation is the *count* of scores. `float("nan")`, `float("inf")`, and
-arbitrary out-of-[0,1] values all pass. The reference miner clamps its own scores to [0,1],
-but nothing in the protocol or the validator *requires* a miner to — a custom/malicious miner
-can send anything.
+arbitrary out-of-[0,1] values all pass and are stored in `prediction_buffer`. The reference
+miner clamps its own scores to [0,1], but nothing in the protocol or the validator *requires*
+a miner to — a custom/malicious miner can send anything.
 
-**Step 2 — NaN propagates into the reward.**
-Those values go into `prediction_buffer` and are scored by `reward()` in
-`poker44/score/scoring.py`, which calls `sklearn`'s `average_precision_score`. With `NaN`
-predictions the resulting reward is `NaN` (NaN arithmetic stays NaN).
+**Step 2 — The reward computation crashes on the non-finite values.**
+`reward()` in `poker44/score/scoring.py` calls `sklearn`'s `average_precision_score`, which
+**explicitly rejects non-finite input**. Running it:
 
-**Step 3 — The "must be positive" guard does not stop NaN.**
-`_select_weight_targets` (`forward.py`):
-
-```python
-sorted_rewards = sorted(reward_map.items(), key=lambda item: (-item[1], item[0]))
-winner_uid, winner_reward = sorted_rewards[0]
-
-if winner_reward <= 0.0:                    # <-- intended to reject "no good miner"
-    return [UID_ZERO], np.asarray([1.0])    #     burn to UID 0
-...
-return [winner_uid], np.asarray([1.0])      # winner gets 100%
+```
+NaN preds, mixed labels : RAISED ValueError: Input contains NaN.
+Inf preds, mixed labels : RAISED ValueError: Input contains infinity or a value too large...
 ```
 
-The problem is IEEE-754 semantics:
+So a NaN reward is **never produced** — sklearn raises first.
 
-- `float("nan") <= 0.0` evaluates to **`False`**, so a NaN reward **passes** the guard that
-  was supposed to catch "nobody earned a positive score."
-- `sorted()` on a list containing NaN is **order-undefined** — NaN comparisons all return
-  False, so a NaN-reward entry can end up at position `[0]` (the winner slot) depending on
-  input order.
-- For `Infinity` scores it is even more direct: `inf` ranks strictly highest in the
-  `average_precision_score` ordering, producing the top reward legitimately-looking.
+**Step 3 — The crash aborts the whole cycle; no weights are set.**
+The `ValueError` is raised inside `_compute_windowed_rewards`, which has **no per-miner
+try/except** around `reward()`. It propagates up to the top-level `forward()` wrapper, which
+merely logs and swallows it:
 
-Net effect: a miner submitting `NaN`/`Inf` scores can be selected as the winner and assigned
-**100% of the weight**, i.e. the full emission — without doing any real detection.
+```python
+async def forward(validator):
+    try:
+        await _run_forward_cycle(validator)   # <-- raises here when it hits the poisoned buffer
+    except Exception:
+        ... log ...                            # swallowed; cycle ends with NO scoring, NO weights
+```
+
+So one miner's malformed scores stop **all** miners in that cycle from being scored or rewarded.
+This is a **denial-of-service**, not a payout capture.
+
+**Step 4 — Chained with Bug #1, the DoS becomes persistent.**
+Bug #1's root defect is that the buffer is **never cleared**. The NaN values stay frozen in the
+attacker's `prediction_buffer` forever. Every subsequent cycle where that UID is included,
+`_compute_windowed_rewards` re-reads the NaN buffer → `reward()` raises again → the cycle aborts
+again. The attacker therefore submits NaN **once**, disappears completely, and the validator's
+scoring keeps crashing on every cycle that UID is sampled — until the process is restarted.
 
 ### Worked example (what you can tell your manager)
 
-1. Attacker registers a miner. Instead of detecting bots, it returns `[NaN, NaN, …]` (one per
-   chunk, correct count so it isn't discarded).
-2. The validator accepts the scores (only the count is checked), stores them, and computes a
-   `NaN` reward for the attacker.
-3. In selection, `NaN <= 0.0` is `False`, so the "no positive miner → burn" safety net does
-   **not** trigger, and the attacker's entry can sort into the winner slot.
-4. The attacker is assigned 100% of the weight and **collects the emission that should have
-   gone to the best honest miner.**
+1. Attacker registers a miner and returns `[NaN, NaN, …]` once (correct count, so it isn't
+   discarded on the length check).
+2. The validator stores those NaNs in the attacker's buffer.
+3. That cycle — and every later cycle the attacker's UID is evaluated — `reward()` raises
+   `ValueError`, the whole cycle aborts, and **no miner receives a score or a weight update**.
+4. The attacker goes fully offline. Because the buffer is never cleared (Bug #1), the poison
+   persists and keeps crashing the reward cycle indefinitely.
 
-**Financial impact:** an attacker games the payout with trivially cheap garbage output; honest
-miners are starved. This is a self-dealing / incentive-theft vulnerability, not just a crash
-risk.
+**Impact:** this does **not** let the attacker win emissions. Instead it lets a single cheap
+miner **stall the validator's entire local scoring/payout pipeline** — starving *every* honest
+miner of the emissions that a functioning cycle would have distributed — for the cost of one
+malformed response.
 
-### How to prove it (repro, no chain needed)
-Two independent, checkable facts establish the bug:
+### Related latent defect (fix defensively, not currently reachable via scores)
+The winner-selection guard is also weak on its own:
 
 ```python
-# Fact A -- the guard is broken:
-assert (float("nan") <= 0.0) is False        # NaN bypasses the "<= 0.0" burn gate
-
-# Fact B -- end to end, a NaN score yields a NaN reward that reaches selection:
-uids, weights = _select_weight_targets({7: float("nan"), 3: 0.5})
-# Depending on dict/sort order, UID 7 (the NaN miner) can occupy the winner slot
-# instead of the honest UID 3, and it is NOT burned to UID 0.
+if winner_reward <= 0.0:                 # float("nan") <= 0.0 is False -> NaN would slip through
+    return [UID_ZERO], np.asarray([1.0])
 ```
 
-Fact A is language-level and indisputable. Fact B demonstrates the NaN reaching the payout
-decision. Together they prove a miner controls whether it wins by choosing its output format.
+Verified in isolation — if a NaN reward *did* reach selection, it would win instead of being
+burned:
+
+```
+select {7: nan, 3: 0.85} -> [0, 7]       # the NaN entry, not honest UID 3, takes the winner slot
+```
+
+Today this path is **not reachable through miner scores** (sklearn crashes before a NaN reward
+is ever produced), so it is a latent bug rather than an active payout-theft vector. It should
+still be hardened, because any future code path that introduced a NaN reward without going
+through sklearn would turn it into a real payout-capture bug.
+
+### How to prove it (repro, no chain needed)
+
+```python
+import numpy as np
+from poker44.score.scoring import reward
+
+# Fact A -- malformed scores crash the reward computation (the DoS):
+try:
+    reward(np.array([float("nan")]*80), np.array([i % 2 for i in range(80)], dtype=bool))
+except ValueError as e:
+    print("crashed as expected:", e)      # -> "Input contains NaN."
+
+# Fact B -- the selection guard is latently weak (would matter if a NaN reward existed):
+assert (float("nan") <= 0.0) is False     # NaN bypasses the "<= 0.0" burn gate
+```
+
+Fact A demonstrates the actual (DoS) behavior. Fact B documents the latent guard weakness. The
+DoS becomes *persistent* only because Bug #1 never clears the buffer — which is why the two
+bugs are best fixed together.
 
 ### Recommended fix
 Reject non-finite and out-of-range scores at the ingestion point, before they ever enter the
@@ -267,22 +301,27 @@ if not np.isfinite(winner_reward) or winner_reward <= 0.0:
 
 - Both are on the **miner → validator** boundary, which is adversarial by design (miners are
   financially motivated to game it).
-- Both can redirect **the entire winner-take-all payout** to the wrong UID — Bug #1 by
-  accident (a dead miner), Bug #3 by deliberate attack (a NaN miner).
+- Both corrupt the payout in complementary ways — Bug #1 **misdirects** the entire
+  winner-take-all payout to a dead-but-formerly-good miner; Bug #3 **halts** payouts entirely
+  by crashing the scoring cycle, and (because Bug #1 never clears the buffer) keeps crashing it.
+- They share a root cause and a fix surface: unvalidated miner output that is buffered and
+  never expired. Fixing them together closes both the misdirection and the persistent DoS.
 - Both fixes are **small, local, and unit-testable** with no chain interaction required, so
   they can ship with regression tests that prove the fix:
   - `test_offline_miner_earns_zero_reward` — a miner with stale history but no current-cycle
     response scores 0.
-  - `test_nan_score_cannot_win` — a NaN/Inf-returning miner is rejected and cannot be the
-    winner; the burn path triggers instead.
+  - `test_nan_scores_do_not_crash_cycle` — a NaN/Inf-returning miner is rejected at ingestion;
+    the reward cycle completes for all other miners instead of raising.
 
 ## 4. Suggested regression tests (acceptance criteria)
 
 | Test | Setup | Expected result after fix |
 |------|-------|---------------------------|
 | Offline miner | UID has a full window of old good predictions, no response this cycle | reward == 0.0; it cannot be the winner |
-| NaN scores | Miner returns `[NaN, …]` (correct count) | response rejected; reward == 0.0; not selected as winner |
-| Inf scores | Miner returns `[inf, …]` | response rejected; reward == 0.0; not selected as winner |
+| NaN scores | Miner returns `[NaN, …]` (correct count) | response rejected at ingestion; **cycle does not crash**; other miners still scored; NaN miner reward == 0.0 |
+| Inf scores | Miner returns `[inf, …]` | response rejected at ingestion; **cycle does not crash**; other miners still scored; Inf miner reward == 0.0 |
+| Persistent-DoS (chain) | UID submitted NaN once, then goes offline | poisoned buffer is cleared/expired; later cycles do not crash; scoring continues for everyone |
+| Selection guard | reward_map contains a NaN value directly | `np.isfinite` guard sends it to the burn path (UID 0), never the winner slot |
 | Out-of-range | Miner returns `[5.0, -2.0, …]` | scores clamped to [0,1] (or rejected); no reward inflation |
 | Honest baseline | Miner returns valid [0,1] scores, responds every cycle | scored normally; unaffected by the fix |
 
